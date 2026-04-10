@@ -17,7 +17,7 @@ export function AuthCenterPanel() {
               <ShieldCheck className="h-5 w-5 text-primary" />
               <h3 className="text-base font-semibold">
                 {t("settings.authCenter.title", {
-                  defaultValue: "OAuth 认证中心",
+                  defaultValue: "OAuth Authentication Center",
                 })}
               </h3>
             </div>

@@ -15,7 +15,7 @@ use crate::provider::Provider;
 use crate::proxy::providers::copilot_auth;
 use crate::proxy::providers::transform::anthropic_to_openai;
 use crate::proxy::providers::transform_responses::anthropic_to_responses;
-use crate::proxy::providers::{get_adapter, AuthInfo, AuthStrategy};
+use crate::proxy::providers::{get_adapter, AuthInfo, AuthStrategy, CodexAdapter};
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -508,7 +508,8 @@ impl StreamCheckService {
             .as_ref()
             .and_then(|meta| meta.is_full_url)
             .unwrap_or(false);
-        let urls = Self::resolve_codex_stream_urls(base_url, is_full_url);
+        let chat_compat = CodexAdapter::new().is_chat_compat_provider(provider);
+        let urls = Self::resolve_codex_stream_urls(base_url, is_full_url, chat_compat);
 
         // 解析模型名和推理等级 (支持 model@level 或 model#level 格式)
         let (actual_model, reasoning_effort) = Self::parse_model_with_effort(model);
@@ -517,19 +518,30 @@ impl StreamCheckService {
         let os_name = Self::get_os_name();
         let arch_name = Self::get_arch_name();
 
-        // Responses API 请求体格式 (input 必须是数组)
-        let mut body = json!({
+        // Responses API request body
+        let mut responses_body = json!({
             "model": actual_model,
             "input": [{ "role": "user", "content": test_prompt }],
             "stream": true
         });
 
-        // 如果是推理模型，添加 reasoning_effort
+        // If reasoning effort is provided (model@effort), keep it for responses-mode checks.
         if let Some(effort) = reasoning_effort {
-            body["reasoning"] = json!({ "effort": effort });
+            responses_body["reasoning"] = json!({ "effort": effort });
         }
 
         for (i, url) in urls.iter().enumerate() {
+            let use_chat_completions = url.to_ascii_lowercase().contains("/chat/completions");
+            let request_body = if use_chat_completions {
+                json!({
+                    "model": actual_model,
+                    "messages": [{ "role": "user", "content": test_prompt }],
+                    "stream": true
+                })
+            } else {
+                responses_body.clone()
+            };
+
             // 严格按照 Codex CLI 请求格式设置 headers
             let response = client
                 .post(url)
@@ -543,7 +555,7 @@ impl StreamCheckService {
                 )
                 .header("originator", "codex_cli_rs")
                 .timeout(timeout)
-                .json(&body)
+                .json(&request_body)
                 .send()
                 .await
                 .map_err(Self::map_request_error)?;
@@ -1195,8 +1207,9 @@ impl StreamCheckService {
         if config_text.trim().is_empty() {
             return None;
         }
-
-        let re = Regex::new(r#"^model\s*=\s*["']([^"']+)["']"#).ok()?;
+        // Match `model = "..."` on any line (with optional indentation),
+        // while avoiding keys like `model_provider`.
+        let re = Regex::new(r#"(?m)^\s*model\s*=\s*["']([^"']+)["']"#).ok()?;
         re.captures(config_text)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().trim().to_string())
@@ -1259,14 +1272,25 @@ impl StreamCheckService {
         }
     }
 
-    fn resolve_codex_stream_urls(base_url: &str, is_full_url: bool) -> Vec<String> {
+    fn resolve_codex_stream_urls(base_url: &str, is_full_url: bool, chat_compat: bool) -> Vec<String> {
         if is_full_url {
             return vec![base_url.to_string()];
         }
 
         let base = base_url.trim_end_matches('/');
 
-        if base.ends_with("/v1") {
+        if chat_compat {
+            if base.ends_with("/v1") {
+                vec![format!("{base}/chat/completions"), format!("{base}/responses")]
+            } else {
+                vec![
+                    format!("{base}/chat/completions"),
+                    format!("{base}/v1/chat/completions"),
+                    format!("{base}/responses"),
+                    format!("{base}/v1/responses"),
+                ]
+            }
+        } else if base.ends_with("/v1") {
             vec![format!("{base}/responses")]
         } else {
             vec![format!("{base}/responses"), format!("{base}/v1/responses")]
@@ -1458,6 +1482,32 @@ mod tests {
         assert_eq!(effort, None);
     }
 
+
+
+    #[test]
+    fn test_extract_codex_model_matches_non_first_line() {
+        let p = make_provider(serde_json::json!({
+            "config": r#"model_provider = "deepseek"
+model = "deepseek-chat"
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com/v1""#
+        }));
+
+        let model = StreamCheckService::extract_codex_model(&p);
+        assert_eq!(model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn test_resolve_test_model_for_codex_prefers_provider_model_from_config_text() {
+        let p = make_provider(serde_json::json!({
+            "config": r#"model_provider = "deepseek"
+model = "deepseek-reasoner""#
+        }));
+
+        let config = StreamCheckConfig::default();
+        let resolved = StreamCheckService::resolve_test_model(&AppType::Codex, &p, &config);
+        assert_eq!(resolved, "deepseek-reasoner");
+    }
     #[test]
     fn test_get_os_name() {
         let os_name = StreamCheckService::get_os_name();
@@ -1582,6 +1632,7 @@ mod tests {
         let urls = StreamCheckService::resolve_codex_stream_urls(
             "https://relay.example/custom/responses",
             true,
+            false,
         );
 
         assert_eq!(urls, vec!["https://relay.example/custom/responses"]);
@@ -1590,20 +1641,57 @@ mod tests {
     #[test]
     fn test_resolve_codex_stream_urls_for_v1_base() {
         let urls =
-            StreamCheckService::resolve_codex_stream_urls("https://api.openai.com/v1", false);
+            StreamCheckService::resolve_codex_stream_urls("https://api.openai.com/v1", false, false);
 
         assert_eq!(urls, vec!["https://api.openai.com/v1/responses"]);
     }
 
     #[test]
     fn test_resolve_codex_stream_urls_for_origin_base() {
-        let urls = StreamCheckService::resolve_codex_stream_urls("https://api.openai.com", false);
+        let urls =
+            StreamCheckService::resolve_codex_stream_urls("https://api.openai.com", false, false);
 
         assert_eq!(
             urls,
             vec![
                 "https://api.openai.com/responses",
                 "https://api.openai.com/v1/responses",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_codex_stream_urls_for_deepseek_v1_base_chat_compat() {
+        let urls = StreamCheckService::resolve_codex_stream_urls(
+            "https://api.deepseek.com/v1",
+            false,
+            true,
+        );
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://api.deepseek.com/v1/chat/completions",
+                "https://api.deepseek.com/v1/responses",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_codex_stream_urls_for_deepseek_origin_base_chat_compat() {
+        let urls = StreamCheckService::resolve_codex_stream_urls(
+            "https://api.deepseek.com",
+            false,
+            true,
+        );
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://api.deepseek.com/chat/completions",
+                "https://api.deepseek.com/v1/chat/completions",
+                "https://api.deepseek.com/responses",
+                "https://api.deepseek.com/v1/responses",
             ]
         );
     }

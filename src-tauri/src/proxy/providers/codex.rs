@@ -5,7 +5,7 @@
 //! ## 客户端检测
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
-use super::{AuthInfo, AuthStrategy, ProviderAdapter};
+use super::{transform_chat_responses::responses_request_to_openai_chat, AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
@@ -30,6 +30,70 @@ impl CodexAdapter {
     #[allow(dead_code)]
     pub fn is_official_client(user_agent: &str) -> bool {
         CODEX_CLIENT_REGEX.is_match(user_agent)
+    }
+
+    fn configured_wire_api(&self, provider: &Provider) -> Option<String> {
+        if let Some(wire_api) = provider.settings_config.get("wire_api").and_then(|v| v.as_str()) {
+            return Some(wire_api.to_string());
+        }
+
+        if let Some(config) = provider.settings_config.get("config") {
+            if let Some(wire_api) = config.get("wire_api").and_then(|v| v.as_str()) {
+                return Some(wire_api.to_string());
+            }
+
+            if let Some(config_str) = config.as_str() {
+                if let Some(start) = config_str.find("wire_api = \"") {
+                    let rest = &config_str[start + 12..];
+                    if let Some(end) = rest.find('"') {
+                        return Some(rest[..end].to_string());
+                    }
+                }
+                if let Some(start) = config_str.find("wire_api = '") {
+                    let rest = &config_str[start + 12..];
+                    if let Some(end) = rest.find('\'') {
+                        return Some(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn has_chat_api_format(&self, provider: &Provider) -> bool {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.api_format.as_deref())
+            .is_some_and(|v| v.eq_ignore_ascii_case("openai_chat"))
+            || provider
+                .settings_config
+                .get("api_format")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("openai_chat"))
+    }
+
+    fn is_deepseek_base_url(base_url: &str) -> bool {
+        let lower = base_url.to_lowercase();
+        lower.contains("api.deepseek.com") || lower.contains("deepseek.com")
+    }
+
+    pub fn is_chat_compat_provider(&self, provider: &Provider) -> bool {
+        if self.has_chat_api_format(provider) {
+            return true;
+        }
+
+        if self
+            .configured_wire_api(provider)
+            .is_some_and(|v| v.eq_ignore_ascii_case("chat"))
+        {
+            return true;
+        }
+
+        self.extract_base_url(provider)
+            .ok()
+            .is_some_and(|base_url| Self::is_deepseek_base_url(&base_url))
     }
 
     /// 从 Provider 配置中提取 API Key
@@ -180,6 +244,18 @@ impl ProviderAdapter for CodexAdapter {
             http::HeaderValue::from_str(&bearer).unwrap(),
         )]
     }
+
+    fn needs_transform(&self, provider: &Provider) -> bool {
+        self.is_chat_compat_provider(provider)
+    }
+
+    fn transform_request(&self, body: serde_json::Value, provider: &Provider) -> Result<serde_json::Value, ProxyError> {
+        if self.is_chat_compat_provider(provider) {
+            responses_request_to_openai_chat(body)
+        } else {
+            Ok(body)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,3 +379,6 @@ mod tests {
         ));
     }
 }
+
+
+

@@ -873,20 +873,21 @@ impl RequestForwarder {
             Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
             None => adapter.needs_transform(provider),
         };
-        let (effective_endpoint, passthrough_query) =
-            if needs_transform && adapter.name() == "Claude" {
-                let api_format = resolved_claude_api_format
-                    .as_deref()
-                    .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
-                rewrite_claude_transform_endpoint(endpoint, api_format, is_copilot)
-            } else {
-                (
-                    endpoint.to_string(),
-                    split_endpoint_and_query(endpoint)
-                        .1
-                        .map(ToString::to_string),
-                )
-            };
+        let (effective_endpoint, passthrough_query) = if needs_transform && adapter.name() == "Claude" {
+            let api_format = resolved_claude_api_format
+                .as_deref()
+                .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
+            rewrite_claude_transform_endpoint(endpoint, api_format, is_copilot)
+        } else if needs_transform && adapter.name() == "Codex" {
+            rewrite_codex_transform_endpoint(endpoint)
+        } else {
+            (
+                endpoint.to_string(),
+                split_endpoint_and_query(endpoint)
+                    .1
+                    .map(ToString::to_string),
+            )
+        };
 
         let url = if is_full_url {
             append_query_to_full_url(&base_url, passthrough_query.as_deref())
@@ -1624,6 +1625,24 @@ fn rewrite_claude_transform_endpoint(
     (rewritten, passthrough_query)
 }
 
+fn rewrite_codex_transform_endpoint(endpoint: &str) -> (String, Option<String>) {
+    let (path, query) = split_endpoint_and_query(endpoint);
+
+    let rewritten_path = match path {
+        "/responses" | "/responses/compact" => "/chat/completions",
+        "/v1/responses" | "/v1/responses/compact" => "/v1/chat/completions",
+        "/codex/v1/responses" | "/codex/v1/responses/compact" => "/codex/v1/chat/completions",
+        _ => path,
+    };
+
+    let rewritten = match query {
+        Some(q) if !q.is_empty() => format!("{rewritten_path}?{q}"),
+        _ => rewritten_path.to_string(),
+    };
+
+    (rewritten, query.map(ToString::to_string))
+}
+
 fn append_query_to_full_url(base_url: &str, query: Option<&str>) -> String {
     match query {
         Some(query) if !query.is_empty() => {
@@ -1946,3 +1965,5 @@ mod tests {
         }
     }
 }
+
+

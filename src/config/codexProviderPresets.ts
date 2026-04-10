@@ -107,6 +107,27 @@ requires_openai_auth = true`,
     iconColor: "#0078D4",
   },
   {
+    name: "DeepSeek",
+    websiteUrl: "https://platform.deepseek.com",
+    apiKeyUrl: "https://platform.deepseek.com/api_keys",
+    category: "third_party",
+    auth: generateThirdPartyAuth(""),
+    config: `model_provider = "deepseek"
+model = "deepseek-chat"
+disable_response_storage = true
+model_context_window = 128000
+model_auto_compact_token_limit = 110000
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/v1"
+wire_api = "responses"
+requires_openai_auth = false`,
+    endpointCandidates: ["https://api.deepseek.com/v1"],
+    icon: "deepseek",
+    iconColor: "#1E88E5",
+  },
+  {
     name: "AiHubMix",
     websiteUrl: "https://aihubmix.com",
     category: "aggregator",
@@ -366,3 +387,4 @@ requires_openai_auth = true`,
     iconColor: "#6566F1",
   },
 ];
+

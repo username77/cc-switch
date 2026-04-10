@@ -15,8 +15,11 @@ use super::{
     handler_context::RequestContext,
     providers::{
         get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
-        streaming_responses::create_anthropic_sse_stream_from_responses, transform,
-        transform_responses,
+        streaming_responses::create_anthropic_sse_stream_from_responses,
+        transform_chat_responses::{
+            create_responses_sse_stream_from_openai_chat, openai_chat_response_to_responses,
+        },
+        transform, transform_responses, CodexAdapter,
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
@@ -306,6 +309,147 @@ async fn handle_claude_transform(
     })
 }
 
+async fn handle_codex_chat_compat_transform(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    let is_stream = response.is_sse();
+
+    if is_stream {
+        let stream = response.bytes_stream();
+        let responses_stream = create_responses_sse_stream_from_openai_chat(stream);
+
+        let usage_collector = {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            let request_model = ctx.request_model.clone();
+            let status_code = status.as_u16();
+            let start_time = ctx.start_time;
+
+            SseUsageCollector::new(start_time, move |events, first_token_ms| {
+                if let Some(usage) = TokenUsage::from_codex_stream_events_auto(&events) {
+                    let model = usage
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| request_model.clone());
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let request_model = request_model.clone();
+
+                    tokio::spawn(async move {
+                        log_usage(
+                            &state,
+                            &provider_id,
+                            "codex",
+                            &model,
+                            &request_model,
+                            usage,
+                            latency_ms,
+                            first_token_ms,
+                            true,
+                            status_code,
+                        )
+                        .await;
+                    });
+                }
+            })
+        };
+
+        let timeout_config = ctx.streaming_timeout_config();
+        let logged_stream = create_logged_passthrough_stream(
+            responses_stream,
+            "Codex/ChatCompat",
+            Some(usage_collector),
+            timeout_config,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        headers.insert(
+            "Connection",
+            axum::http::HeaderValue::from_static("keep-alive"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((status, headers, body).into_response());
+    }
+
+    let body_timeout = if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+        std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    let (mut response_headers, status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let upstream_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        log::error!("[Codex/ChatCompat] parse upstream response failed: {e}, body: {body_str}");
+        ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
+    })?;
+
+    let responses_body = openai_chat_response_to_responses(upstream_response).map_err(|e| {
+        log::error!("[Codex/ChatCompat] transform response failed: {e}");
+        e
+    })?;
+
+    if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_body) {
+        let model = responses_body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or(&ctx.request_model)
+            .to_string();
+        let latency_ms = ctx.latency_ms();
+
+        let request_model = ctx.request_model.clone();
+        tokio::spawn({
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            async move {
+                log_usage(
+                    &state,
+                    &provider_id,
+                    "codex",
+                    &model,
+                    &request_model,
+                    usage,
+                    latency_ms,
+                    None,
+                    false,
+                    status.as_u16(),
+                )
+                .await;
+            }
+        });
+    }
+
+    let mut builder = axum::response::Response::builder().status(status);
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header("content-type", "application/json");
+
+    let response_body = serde_json::to_vec(&responses_body)
+        .map_err(|e| ProxyError::TransformError(format!("Failed to serialize response: {e}")))?;
+
+    let body = axum::body::Body::from(response_body);
+    builder
+        .body(body)
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {e}")))
+}
+
 fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
     match uri.query() {
         Some(query) => format!("{endpoint}?{query}"),
@@ -422,6 +566,10 @@ pub async fn handle_responses(
     ctx.provider = result.provider;
     let response = result.response;
 
+    if CodexAdapter::new().is_chat_compat_provider(&ctx.provider) {
+        return handle_codex_chat_compat_transform(response, &ctx, &state).await;
+    }
+
     process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
 }
 
@@ -475,6 +623,10 @@ pub async fn handle_responses_compact(
 
     ctx.provider = result.provider;
     let response = result.response;
+
+    if CodexAdapter::new().is_chat_compat_provider(&ctx.provider) {
+        return handle_codex_chat_compat_transform(response, &ctx, &state).await;
+    }
 
     process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
 }
@@ -624,3 +776,6 @@ async fn log_usage(
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
 }
+
+
+

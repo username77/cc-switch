@@ -23,6 +23,7 @@ pub mod streaming;
 pub mod streaming_responses;
 pub mod transform;
 pub mod transform_responses;
+pub mod transform_chat_responses;
 
 use crate::app_config::AppType;
 use crate::provider::Provider;
@@ -501,3 +502,5 @@ mod tests {
         assert_eq!(adapter.name(), "Gemini");
     }
 }
+
+
